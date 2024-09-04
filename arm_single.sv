@@ -102,24 +102,70 @@ module top(input  logic        clk, reset,
            output logic        MemWrite);
 
   logic [31:0] PC, Instr, ReadData;
+  logic ByteOP; //adicionou flag op de byte
   
   // instantiate processor and memories
-  arm arm(clk, reset, PC, Instr, MemWrite, DataAdr, 
+  arm arm(clk, reset, PC, Instr, MemWrite, ByteOP, DataAdr, //adicionou flag op de byte 
           WriteData, ReadData);
   imem imem(PC, Instr);
-  dmem dmem(clk, MemWrite, DataAdr, WriteData, ReadData);
+  dmem dmem(clk, MemWrite, ByteOP, DataAdr, WriteData, ReadData);
 endmodule
 
-module dmem(input  logic        clk, we,
+module dmem(input  logic        clk, we, ByteOP,
             input  logic [31:0] a, wd,
             output logic [31:0] rd);
 
   logic [31:0] RAM[63:0];
 
-  assign rd = RAM[a[31:2]]; // word aligned
+  //criação para operação de byte
+always_comb
+  begin
+    if (ByteOP)
+      case(a % 3'b100) 
+        2'b00:  begin // read byte [7:0]
+                  assign rd = {24'b0, RAM[a[31:2]][7:0]}; 
+                end
+        2'b01:  begin // read byte [15:8]
+                  assign rd = {24'b0, RAM[a[31:2]][15:8]}; 
+                end
+        2'b10:  begin // read byte [23:16]
+                  assign rd = {24'b0, RAM[a[31:2]][23:16]}; 
+                end 
+        2'b11:  begin // read byte [31:24]
+                  assign rd = {24'b0, RAM[a[31:2]][31:24]}; 
+                end
+      endcase
+    else
+      begin
+        assign rd = RAM[a[31:2]]; // word aligned
+      end
+  end
 
+  //criação para modificação de byte
   always_ff @(posedge clk)
-    if (we) RAM[a[31:2]] <= wd;
+    if (we) 
+      begin
+        if (ByteOP)
+          case(a % 3'b100) 
+           2'b00:  begin // write byte [:0]
+                     RAM[a[31:2]] <= {RAM[a[31:2]][31:8], wd[7:0]};
+                   end
+           2'b01:  begin // write byte [:0]
+                     RAM[a[31:2]] <= {RAM[a[31:2]][31:16], wd[7:0], RAM[a[31:2]][7:0]};
+                   end
+           2'b10:  begin // write byte [:0]
+                     RAM[a[31:2]] <= {RAM[a[31:2]][31:24], wd[7:0], RAM[a[31:2]][15:0]};
+                   end 
+           2'b11:  begin // write byte [:0]
+                     RAM[a[31:2]] <= {wd[7:0], RAM[a[31:2]][23:0]};
+                   end
+      endcase
+    else
+      begin
+        RAM[a[31:2]] <= wd;
+      end
+    end
+
 endmodule
 
 module imem(input  logic [31:0] a,
@@ -136,19 +182,20 @@ endmodule
 module arm(input  logic        clk, reset,
            output logic [31:0] PC,
            input  logic [31:0] Instr,
-           output logic        MemWrite,
+           output logic        MemWrite, ByteOP, //adicionei ByteOP flag
            output logic [31:0] ALUResult, WriteData,
            input  logic [31:0] ReadData);
 
   logic [3:0] ALUFlags;
   logic       RegWrite, MovFlag,
               ALUSrc, MemtoReg, PCSrc;
-  logic [1:0] RegSrc, ImmSrc, ALUControl;
+  logic [1:0] RegSrc, ImmSrc;
+  logic [2:0] ALUControl; // Mudando o tamanho para + operações (Mudando 1 bit p 2 bit)
 
   controller c(clk, reset, Instr[31:12], ALUFlags, 
                RegSrc, RegWrite, ImmSrc, 
                ALUSrc, ALUControl,
-               MemWrite, MemtoReg, MovFlag, PCSrc);
+               MemWrite, MemtoReg, MovFlag, ByteOP, PCSrc); //Adicionando MovFlag e ByteOP
   datapath dp(clk, reset, 
               RegSrc, RegWrite, ImmSrc,
               ALUSrc, ALUControl,
@@ -164,9 +211,9 @@ module controller(input  logic         clk, reset,
                   output logic         RegWrite,
                   output logic [1:0]   ImmSrc,
                   output logic         ALUSrc, 
-                  output logic [1:0]   ALUControl,
+                  output logic [2:0]   ALUControl, //Mudando o tamanho para + operações (Mudando 1 bit p 2 bit)
                   output logic         MemWrite, MemtoReg,
-                  output logic         MovFlag,
+                  output logic         MovFlag, ByteOP, //Adicionando MovFlag e ByteOP
                   output logic         PCSrc);
 
   logic [1:0] FlagW;
@@ -174,9 +221,9 @@ module controller(input  logic         clk, reset,
   
   decoder dec(Instr[27:26], Instr[25:20], Instr[15:12],
               FlagW, PCS, RegW, MemW,
-              MemtoReg, ALUSrc, MOVF, ImmSrc, RegSrc, ALUControl);
+              MemtoReg, ALUSrc, MOVF, NoWrite, ByteOP, ImmSrc, RegSrc, ALUControl); //Adicionando NoWrite e ByteOP e MovF
   condlogic cl(clk, reset, Instr[31:28], ALUFlags,
-               FlagW, PCS, RegW, MemW, MOVF,
+               FlagW, PCS, RegW, MemW, MOVF, NoWrite,
                PCSrc, RegWrite, MemWrite, MovFlag);
 endmodule
 
@@ -185,7 +232,7 @@ module decoder(input  logic [1:0] Op,
                input  logic [3:0] Rd,
                output logic [1:0] FlagW,
                output logic       PCS, RegW, MemW,
-               output logic       MemtoReg, ALUSrc, MOVF,
+               output logic       MemtoReg, ALUSrc, MOVF, NoWrite, ByteOP, //acrescentou o NoWrite (operações sem escritas) e ByteOP
                output logic [1:0] ImmSrc, RegSrc, ALUControl);
 
   logic [9:0] controls;
@@ -200,10 +247,13 @@ module decoder(input  logic [1:0] Op,
   	                        // Data processing register
   	         else           controls = 10'b0000001001; 
   	                        // LDR
-  	  2'b01: if (Funct[0])  controls = 10'b0001111000; 
+  	  2'b01: begin
+        ByteOP = Funct[2]; // Operação de Byte
+         if (Funct[0])  controls = 10'b0001111000; 
   	                        // STR
   	         else           controls = 10'b1001110100; 
   	                        // B
+      end
   	  2'b10:                controls = 10'b0110100010; 
   	                        // Unimplemented
   	  default:              controls = 10'bx;          
@@ -218,55 +268,55 @@ module decoder(input  logic [1:0] Op,
       case(Funct[4:1]) 
   	   4'b0100: begin
                   ALUControl = 3'b000; // ADD
-   //               NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b0;
 		     end
 
   	    4'b0010: begin
                   ALUControl = 3'b001; // SUB
-   //               NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b0;
 		     end
 
         4'b0000: begin
                   ALUControl = 3'b010; // AND
-   //               NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b0;
 		     end
 
   	    4'b1100: begin
                   ALUControl = 3'b011; // ORR
-  //                NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b0;
 		     end
 
         4'b1010: begin
                   ALUControl = 3'b001; // CMP 
-//                  NoWrite = 1'b1;
+                  NoWrite = 1'b1;
                   MOVF = 1'b0;
 		     end
 
 	      4'b1101: begin
                   ALUControl = 3'bx; // MOV
- //                 NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b1;
 		     end
 
 	      4'b1000: begin
                   ALUControl = 3'b010; // TST 
- //                 NoWrite = 1'b1;
+                  NoWrite = 1'b1;
                   MOVF = 1'b0;
 		     end
 
 	      4'b0001: begin
                   ALUControl = 3'b100; // EOR
- //                 NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b0;
 		     end
 	
   	    default: begin
                   ALUControl = 3'bx;  // unimplemented
- //                 NoWrite = 1'b0;
+                  NoWrite = 1'b0;
                   MOVF = 1'b0;
             end
       endcase
@@ -289,7 +339,7 @@ module condlogic(input  logic       clk, reset,
                  input  logic [3:0] Cond,
                  input  logic [3:0] ALUFlags,
                  input  logic [1:0] FlagW,
-                 input  logic       PCS, RegW, MemW, MOVF,
+                 input  logic       PCS, RegW, MemW, MOVF, NoWrite, // adição do NoWrite
                  output logic       PCSrc, RegWrite, MemWrite, MovFlag);
                  
   logic [1:0] FlagWrite;
@@ -304,7 +354,7 @@ module condlogic(input  logic       clk, reset,
   // write controls are conditional
   condcheck cc(Cond, Flags, CondEx);
   assign FlagWrite = FlagW & {2{CondEx}};
-  assign RegWrite  = RegW  & CondEx;
+  assign RegWrite  = RegW  & CondEx & ~NoWrite; //registra só se tudo for 1 (RegW, CondEx e Negado NoWrite)
   assign MemWrite  = MemW  & CondEx;
   assign PCSrc     = PCS   & CondEx;
   assign MovFlag   = MOVF  & CondEx;
@@ -468,10 +518,12 @@ module alu(input  logic [31:0] a, b,
   assign sum = a + condinvb + ALUControl[0];
 
   always_comb
-    casex (ALUControl[1:0])
-      2'b0?: Result = sum;
-      2'b10: Result = a & b;
-      2'b11: Result = a | b;
+    casex (ALUControl[2:0]) //Aumentou tamanho AluControl
+      3'b00?: Result = sum;
+      3'b010: Result = a & b;
+      3'b011: Result = a | b;
+      3'b111: Result = a ^ b; //adicionou para fazer EOR
+
     endcase
 
   assign neg      = Result[31];
